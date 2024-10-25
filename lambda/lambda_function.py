@@ -1,84 +1,108 @@
+# With the help of GitHub Copilot, updated to address error: [module 'botocore.crt' has no attribute 'auth']
+
 import boto3
-from botocore import awsrequest
-from botocore import crt
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
+import logging
+import os
 
-failover_header = 'originTypeFailover'
-cf_read_only_headers_list = [h.lower() for h in [
-    'Accept-Encoding',
-    'Content-Length',
-    'If-Modified-Since',
-    'If-None-Match',
-    'If-Range',
-    'If-Unmodified-Since',
-    'Transfer-Encoding',
-    'Via'
-]]
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger()
 
+# Externalize configuration
+FAILOVER_HEADER = os.getenv('FAILOVER_HEADER', 'originTypeFailover')
+CF_READ_ONLY_HEADERS_LIST = [h.lower() for h in os.getenv('CF_READ_ONLY_HEADERS_LIST', 'Accept-Encoding,Content-Length,If-Modified-Since,If-None-Match,If-Range,If-Unmodified-Since,Transfer-Encoding,Via').split(',')]
 
-class SigV4AWrapper:
-
+class SigV4Wrapper:
     def __init__(self):
         self._session = boto3.Session()
-
+        
     def get_auth_headers(self, method, endpoint, data, region, service, headers):
-        sigv4a = crt.auth.CrtS3SigV4AsymAuth(self._session.get_credentials(), service, region)
-        request = awsrequest.AWSRequest(method=method, url=endpoint, data=data, headers=headers)
-        sigv4a.add_auth(request)
+        logger.debug(f"Constructing SigV4 auth headers for {method} {endpoint}")
+        if headers is None:
+            headers = {}
+        credentials = self._session.get_credentials().get_frozen_credentials()
+        request = AWSRequest(method=method, url=endpoint, data=data, headers=headers)
+        SigV4Auth(credentials, service, region).add_auth(request)
         prepped = request.prepare()
         return prepped.headers
 
+def handle_failover_request(request):
+    if FAILOVER_HEADER in request['headers']:
+        return request
+    return None
+
+def construct_endpoint(request):
+    query_string = request.get('querystring', '')
+    endpoint = f"https://{request['origin']['custom']['domainName']}{request['uri']}"
+    if query_string:
+        endpoint += f"?{query_string}"
+    return endpoint, query_string
+
+def handle_request_body(request):
+    if 'body' in request:
+        if request['body'].get('inputTruncated', False):
+            return {
+                'status': '413',
+                'statusDescription': 'Payload Too Large'
+            }, None
+        return None, request['body'].get('data', '')
+    return None, None
+
+def filter_headers(headers):
+    cf_read_only_headers = {}
+    for header in CF_READ_ONLY_HEADERS_LIST:
+        if header in headers:
+            cf_read_only_headers[header] = headers[header][0]['value']
+    return cf_read_only_headers
 
 def lambda_handler(event, context):
     request = event['Records'][0]['cf']['request']
-
-    origin_key = list(request['origin'].keys())[0]
-    custom_headers = request['origin'][origin_key].get('customHeaders', {})
-
-    # Check failover case. If CloudFront origin customer header is included that signals it's the failover request.
-    # In this case, assumed, SigV4A singing should not be performed and
-    # unmodified request should be used for the failover origin.
-    if failover_header in custom_headers:
-        return request
+    logger.debug(f"Received request: {request}")
+    # Check if this is a failover request
+    failover_response = handle_failover_request(request)
+    if failover_response:
+        logger.debug(f"Failover request detected, returning {failover_response}")
+        return failover_response
 
     method = request["method"]
-    endpoint = f"https://{request['origin']['custom']['domainName']}{request['uri']}"
-    data = None  # Empty for GET, could be mapped from request, if there is such case. E.g. request['body']['data']
-    region = '*'  # For S3 Multi-Region Access Point it's '*' (e.g. all regions). Also, that's why SigV4A is required.
-    service = 's3'
-
+    endpoint, query_string = construct_endpoint(request)
+    
+    # Handle request body for methods like PUT, POST
+    error_response, data = handle_request_body(request)
+    if error_response:
+        logger.warning(f"Error during request body handling: {error_response}")
+        return error_response
+    
     headers = request["headers"]
-    request_headers_list = list(headers.keys())
+    cf_read_only_headers = filter_headers(headers)
 
-    cf_read_only_headers = {}
-    # Some CloudFront headers are read-only and can't be removed from the request.
-    # Therefore those have to be part of signing headers. See more details in docs
-    # https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/edge-functions-restrictions.html
-    for h in cf_read_only_headers_list:
-        if h in request_headers_list:
-            cf_read_only_headers[headers[h][0]['key']] = headers[h][0]['value']
+    # Sign the request
+    try:
+        logger.debug(f"Signing request for {method} {endpoint}")
+        auth_headers = SigV4Wrapper().get_auth_headers(method, endpoint, data, '*', 's3', cf_read_only_headers)
+    except Exception as e:
+        logger.error(f"Error during SigV4 signing: {str(e)}")
+        return {
+            'status': '500',
+            'statusDescription': 'Internal Server Error'
+        }
 
-    # CloudFront adds "X-Amz-Cf-Id" header after Origin request Lambda but before the request to the origin.
-    # Therefore it has to be part of the signing request.
-    cf_read_only_headers['X-Amz-Cf-Id'] = event['Records'][0]['cf']['config']['requestId']
-
-    # Sign the request with Signature Version 4A (SigV4A).
-    auth_headers = SigV4AWrapper().get_auth_headers(method, endpoint, data, region, service, cf_read_only_headers)
-
-    # "X-Amz-Cf-Id" header can't be directly set in request object.
-    # Therefore it has to be part of the signing request, however has to be removed from the
-    # request object as CloudFront will set it before making request to the origin.
-    auth_headers.pop('X-Amz-Cf-Id')
+    # Remove 'X-Amz-Cf-Id' header as CloudFront will set it
+    auth_headers.pop('X-Amz-Cf-Id', None)
 
     cf_headers = {}
-    # Add SigV4A auth headers in the by CloutFront expected data structure.
-    for k, v, in auth_headers.items():
+    # Add SigV4 auth headers in the CloudFront expected data structure
+    for k, v in auth_headers.items():
         cf_headers[k.lower()] = [{'key': k, 'value': v}]
 
-    # Override headers to only include the one expected by S3 Multi-Region Access Point (e.g. the one that are signed).
+    # Override headers to only include the ones expected by S3 Multi-Region Access Point
     request['headers'] = cf_headers
 
-    # If querystring is in request, remove as else signature won't match.
-    # Note: You can have querystring be part of the request, however you first need to add those in the signing request.
-    request.pop('querystring')
+    # Preserve the query string
+    if query_string:
+        request['querystring'] = query_string
 
+    logger.debug(f"Returning request: {request}")
     return request
